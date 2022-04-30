@@ -3,16 +3,17 @@
 import rospy 
 import tf
 from math import *
-from nav_msgs import Odometry
+from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist, Point
 import numpy as np
+import math
 
 class Controller:
 
     def __init__(self) -> None:
         rospy.init_node("controller", anonymous=False)
 
-        self.odom_subscriber = rospy.Subscriber("/odom", Odometry)
+        self.odom_subscriber = rospy.Subscriber("/odom", Odometry, callback=self.odom_callback)
         self.cmd_publisher = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
 
         self.linear_speed = rospy.get_param("/controller/linear_speed")     
@@ -31,6 +32,8 @@ class Controller:
         self.ki_angle = 0
         self.kd_angle = 0
 
+        self.distance_star = -0.02
+
         self.goal = Point()
         self.g_index = 0
 
@@ -45,30 +48,34 @@ class Controller:
         self.x_inputs = np.array([])
         self.y_inputs = np.array([])
 
+        
+
+        self.set_shape()
+        self.start()
+
+    def set_shape(self):
+        
         print("Please enter shape number for the following path: ")
         print("1. logarithmic spiral")
         print("2. two half circle")
         print("3. archimedean spiral")
         print("4. octagonal")
-        shape_number = input()
-
-        self.set_shape(shape_number)
-
-    def set_shape(number):
+        number  = input()
+        
         if number == 1:
             a = 0.17
-            k = math.tan(a)
+            k = tan(a)
             X , Y = [] , []
             for i in range(150):
-                t = i / 20 * math.pi
-                dx = a * math.exp(k * t) * math.cos(t)
-                dy = a * math.exp(k * t) * math.sin(t)
+                t = i / 20 * pi
+                dx = a * exp(k * t) * cos(t)
+                dy = a * exp(k * t) * sin(t)
                 X.append(dx)
                 Y.append(dy) 
             self.x_inputs = np.array(X)
             self.y_inputs = np.array(Y)
-
         elif number == 2:
+            
             X1 = np.linspace(-6., -2 , 50)
             Y1 = np.zeros((50,))
 
@@ -90,7 +97,7 @@ class Controller:
 
             self.x_inputs = X
             self.y_inputs = Y
-
+        
         elif number == 3:
             growth_factor = 0.1
             X , Y = [] , []
@@ -137,10 +144,11 @@ class Controller:
             self.x_inputs = X
             self.y_inputs = Y
 
+        
     def start(self):
         goal = Point()
         msg = rospy.wait_for_message("/odom", Odometry)
-        position = msg.pose.position
+        position = msg.pose.pose.position
         for i in range(self.x_inputs.size):
             error = [sqrt(pow(self.x_inputs[i]-position.x, 2) + pow(self.y_inputs[i] - position.y, 2))]
         
@@ -151,6 +159,83 @@ class Controller:
 
         self.g_index = nearest_point
         self.goal = goal
+
+    def odom_callback(self, msg: Odometry):
+        twist = Twist()
+        distance, angle = self.get_euler(msg)
+        curr_time = rospy.get_time()
+
+        d_time = curr_time - self.time
+        self.time = curr_time
+
+        self.d_integral = self.d_integral + (d_time*distance)
+        self.a_integral = self.a_integral + (d_time*angle)
+
+        dis = distance - self.distance
+        ang = angle - self.angle
+
+        if distance <= self.stop_distance:
+            self.next_goal()
+        else:
+            linear_speed = (self.kp_distance*distance) + (self.ki_distance*self.d_integral) + (self.kd_distance*dis)
+            if linear_speed < 0:
+                twist.linear.x = max(linear_speed, -self.linear_speed)
+            else:
+                twist.linear.x = min(linear_speed, self.linear_speed)
+
+            angular_speed = (self.kp_angle*angle) + (self.ki_angle*self.a_integral) + (self.kd_angle*ang)
+            if angular_speed < 0:
+                twist.angular.z = max(angular_speed, -self.angular_speed)
+            else:
+                twist.angular.z = min(angular_speed, self.angular_speed)
+
+            self.distance = dis
+            self.angular = ang
+
+            self.cmd_publisher.publish(twist)
+
+    def get_euler(self, msg: Odometry):
+        curr_position = msg.pose.pose.position
+        curr_orientation = msg.pose.pose.orientation
+
+        pose = msg.pose.pose
+        diff_x = self.goal.x - curr_position.x
+        diff_y = self.goal.y - curr_position.y
+
+        distance = sqrt(pow(diff_x,2)+pow(diff_y,2)) + self.distance_star
+        if distance < 0:
+            distance = 0
+
+        # Rotation
+        yaws = atan2(self.goal.y - curr_position.y, self.goal.x - curr_position.x)
+        roll, pitch, yaw = tf.transformations.euler_from_quaternion((
+            curr_orientation.x, curr_orientation.y, curr_orientation.z, curr_orientation.w
+        ))
+
+        if yaws < 0:
+            yaws += radians(360)
+        if yaw < 0:
+            yaw += radians(360)
+
+        orientation = 0
+        if yaws > yaw and yaws - yaw > radians(360) - (yaws - yaw):
+            orientation = -(radians(360) - (yaws - yaw))
+        elif yaws > yaw and yaws - yaw < radians(360) - (yaws - yaw):
+            orientation = yaws - yaw
+        elif yaw > yaws and yaw - yaws > radians(360) - (yaw - yaws):
+            orientation = radians(360) - (yaw - yaws)
+        elif yaw > yaws and yaw - yaws < radians(360) - (yaw - yaws):
+            orientation = -(yaw - yaws)
+
+        return distance, orientation
+
+    def next_goal(self):
+        goal = Point()
+        self.g_index = (self.g_index + 1) % self.x_inputs.size
+        goal.x = self.x_inputs[self.g_index]
+        goal.y = self.y_inputs[self.g_index]
+        self.goal = goal
+
 if __name__ == "__main__":
     controller = Controller()
     rospy.spin()
